@@ -1,0 +1,255 @@
+name: Bump preview & verify Cloud deployment
+
+# Once a day, pin every @medusajs/* dependency on the `preview` branch to the
+# latest published `preview` version, commit the bump directly to `preview`
+# (no PR), then track the Cloud deployment that the push triggers. If the
+# deployment fails, the build logs are posted to a Slack monitoring channel.
+#
+# Required configuration (Settings > Secrets and variables > Actions):
+#   Secrets:   MCLOUD_TOKEN, SLACK_WEBHOOK_URL_CLOUD
+#   Variables: CLOUD_TEST_ORG_ID, CLOUD_TEST_PROJECT, CLOUD_TEST_ENVIRONMENT
+# CLOUD_TEST_ENVIRONMENT must be the preview environment's handle or `projenv_`
+# id (not its name), and that environment must auto-deploy on push to `preview`.
+# `preview` must allow the workflow to push (no branch protection blocking the
+# GITHUB_TOKEN, or grant an exception).
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # daily at 06:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: bump-preview
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the bump commit to the preview branch
+
+jobs:
+  bump-and-verify:
+    name: Bump preview and verify it deploys on Medusa Cloud
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MCLOUD_TOKEN: ${{ secrets.MCLOUD_TOKEN }}
+      CLOUD_ORG: ${{ vars.CLOUD_TEST_ORG_ID }}
+      CLOUD_PROJECT: ${{ vars.CLOUD_TEST_PROJECT }}
+      # The environment to build against. Use its handle or `projenv_` id
+      # (not its name, which can be ambiguous across environments).
+      CLOUD_ENVIRONMENT: ${{ vars.CLOUD_TEST_ENVIRONMENT }}
+    steps:
+      - name: Checkout preview
+        uses: actions/checkout@v4
+        with:
+          ref: preview
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Pin @medusajs/* to their latest preview versions and refresh the
+      # pnpm lockfile. Detect whether anything actually changed.
+      - name: Bump @medusajs/* to latest preview
+        id: bump
+        run: |
+          node ./.github/scripts/bump-preview.mjs
+          pnpm install --lockfile-only --no-frozen-lockfile
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already on the latest preview — nothing to bump."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit & push bump to preview
+        id: commit
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          PREVIEW_VERSION=$(npm view @medusajs/medusa@preview version)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "chore: bump @medusajs/* to preview ${PREVIEW_VERSION}"
+          git push origin preview
+          SHA=$(git rev-parse HEAD)
+          echo "Pushed bump commit $SHA (@medusajs/medusa@preview = $PREVIEW_VERSION)."
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "PREVIEW_VERSION=$PREVIEW_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install Medusa Cloud CLI
+        if: steps.bump.outputs.changed == 'true'
+        run: npm install -g @medusajs/mcloud
+
+      - name: Verify Cloud authentication
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          if ! mcloud whoami --json | jq -e '.auth.kind != "none"' > /dev/null; then
+            echo "::error::Medusa Cloud CLI is not authenticated. Check the MCLOUD_TOKEN secret."
+            exit 1
+          fi
+
+      - name: Set active Cloud context
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          mcloud use \
+            --organization "$CLOUD_ORG" \
+            --project "$CLOUD_PROJECT" \
+            --environment "$CLOUD_ENVIRONMENT"
+
+      # Fail fast with a clear message if the target environment is misconfigured,
+      # and record which environment (and its type) the build will run against.
+      - name: Confirm target environment
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          ENV_JSON=$(mcloud environments get "$CLOUD_ENVIRONMENT" \
+            --organization "$CLOUD_ORG" \
+            --project "$CLOUD_PROJECT" \
+            --json)
+          NAME=$(echo "$ENV_JSON" | jq -r '.name // empty')
+          HANDLE=$(echo "$ENV_JSON" | jq -r '.handle // empty')
+          TYPE=$(echo "$ENV_JSON" | jq -r '.type // "unknown"')
+          if [ -z "$NAME" ] && [ -z "$HANDLE" ]; then
+            echo "::error::Could not resolve environment '$CLOUD_ENVIRONMENT' in project '$CLOUD_PROJECT'. Set CLOUD_TEST_ENVIRONMENT to the target environment's handle or projenv_ id."
+            exit 1
+          fi
+          echo "Target environment: ${NAME:-$HANDLE} (handle=${HANDLE:-n/a}, type=$TYPE)"
+
+      # The push to `preview` auto-triggers a Cloud deployment. Find the build
+      # for the exact commit we just pushed.
+      - name: Resolve the deployment for the pushed commit
+        id: build
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          SHA="${{ steps.commit.outputs.sha }}"
+          for i in $(seq 1 30); do # up to ~5 min for Cloud to register the push
+            BUILD=$(mcloud deployments list \
+              --organization "$CLOUD_ORG" \
+              --project "$CLOUD_PROJECT" \
+              --environment "$CLOUD_ENVIRONMENT" \
+              --commit "$SHA" --limit 1 --json 2>/dev/null | jq -r '.[0].id // empty' 2>/dev/null || echo "")
+            if [ -n "$BUILD" ]; then
+              echo "Cloud deployment for $SHA: $BUILD"
+              echo "build_id=$BUILD" >> "$GITHUB_OUTPUT"
+              echo "BUILD_ID=$BUILD" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "[$i/30] waiting for Cloud to start a deployment for commit $SHA..."
+            sleep 10
+          done
+          echo "::error::No Cloud deployment appeared for commit $SHA within timeout. Confirm the '$CLOUD_ENVIRONMENT' environment auto-deploys on push to preview."
+          exit 1
+
+      - name: Poll deployment until it settles
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          BUILD_ID="${{ steps.build.outputs.build_id }}"
+          MAX_ATTEMPTS=120 # ~40 min at a 20s interval
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            BUILD=$(mcloud deployments get "$BUILD_ID" \
+              --organization "$CLOUD_ORG" \
+              --project "$CLOUD_PROJECT" \
+              --json)
+            BACKEND=$(echo "$BUILD" | jq -r '.backend_status // "unknown"')
+            STOREFRONT=$(echo "$BUILD" | jq -r '.storefront_status // "none"')
+            echo "[$i/$MAX_ATTEMPTS] backend=$BACKEND storefront=$STOREFRONT"
+
+            # Persist latest statuses for the Slack alert step.
+            echo "BACKEND_STATUS=$BACKEND" >> "$GITHUB_ENV"
+            echo "STOREFRONT_STATUS=$STOREFRONT" >> "$GITHUB_ENV"
+
+            case "$BACKEND" in
+              build-failed|deployment-failed|timed-out|canceled)
+                echo "::error::Backend deployment ended in status: $BACKEND"
+                exit 1
+                ;;
+            esac
+            case "$STOREFRONT" in
+              build-failed|deployment-failed|timed-out|canceled)
+                echo "::error::Storefront deployment ended in status: $STOREFRONT"
+                exit 1
+                ;;
+            esac
+
+            if [ "$BACKEND" = "deployed" ] && { [ "$STOREFRONT" = "deployed" ] || [ "$STOREFRONT" = "none" ]; }; then
+              echo "Preview deployment succeeded."
+              exit 0
+            fi
+
+            sleep 20
+          done
+          echo "::error::Deployment did not reach a terminal state within the timeout."
+          echo "BACKEND_STATUS=polling-timeout" >> "$GITHUB_ENV"
+          exit 1
+
+      - name: Capture build logs on failure
+        if: failure() && env.BUILD_ID != ''
+        run: |
+          echo "Fetching backend build logs for $BUILD_ID..."
+          mcloud deployments build-logs "$BUILD_ID" \
+            --organization "$CLOUD_ORG" \
+            --project "$CLOUD_PROJECT" \
+            --type backend > backend-build.log 2>&1 || true
+          # Slack section text is capped at 3000 chars; keep the last chunk only.
+          EXCERPT=$(tail -n 40 backend-build.log 2>/dev/null | tail -c 2500 || echo "")
+          {
+            echo "LOG_EXCERPT<<LOG_EOF"
+            if [ -n "$EXCERPT" ]; then echo "$EXCERPT"; else echo "(no build logs available)"; fi
+            echo "LOG_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload build logs
+        if: failure() && env.BUILD_ID != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-build-logs
+          path: backend-build.log
+          if-no-files-found: ignore
+
+      - name: Post deployment failure to Slack
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL_CLOUD: ${{ secrets.SLACK_WEBHOOK_URL_CLOUD }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(jq -n \
+            --arg version "${PREVIEW_VERSION:-unknown}" \
+            --arg env_name "${CLOUD_ENVIRONMENT:-unknown}" \
+            --arg build "${BUILD_ID:-not started}" \
+            --arg backend "${BACKEND_STATUS:-unknown}" \
+            --arg storefront "${STOREFRONT_STATUS:-unknown}" \
+            --arg run_url "$RUN_URL" \
+            --arg logs "${LOG_EXCERPT:-No build logs captured.}" \
+            '{
+              blocks: [
+                {
+                  type: "header",
+                  text: { type: "plain_text", text: "Preview deployment failed on Medusa Cloud ⛔", emoji: true }
+                },
+                {
+                  type: "section",
+                  fields: [
+                    { type: "mrkdwn", text: ("*Preview version:*\n" + $version) },
+                    { type: "mrkdwn", text: ("*Environment:*\n" + $env_name) },
+                    { type: "mrkdwn", text: ("*Build:*\n" + $build) },
+                    { type: "mrkdwn", text: ("*Backend / Storefront:*\n" + $backend + " / " + $storefront) }
+                  ]
+                },
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: ("*Build log excerpt:*\n```" + $logs + "```") }
+                },
+                {
+                  type: "section",
+                  text: { type: "mrkdwn", text: ("<" + $run_url + "|View the workflow run>") }
+                }
+              ]
+            }')
+          curl -sSf -X POST -H "Content-type: application/json" \
+            --data "$PAYLOAD" \
+            "$SLACK_WEBHOOK_URL_CLOUD"
