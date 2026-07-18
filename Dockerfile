@@ -2,12 +2,13 @@ FROM node:20-alpine
 
 WORKDIR /server
 
-# COPY package.json package-lock.json turbo.json ./
-COPY package.json turbo.json ./
+RUN npm install pnpm@10.11.1 -g
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json .npmrc ./
 COPY apps/backend/package.json ./apps/backend/
 COPY apps/storefront/package.json ./apps/storefront/
 
-RUN npm install --legacy-peer-deps
+RUN pnpm install --frozen-lockfile
 
 COPY . .
 
